@@ -137,3 +137,46 @@ const pipeline: SimPass[] = [applyForces, solveCollisions, integrate, /* 数百 
 3. Canvas 2D 批量绘制（颜色分桶 / sprite 预渲染）。
 4. DPR + ResizeObserver 适配。
 5. fps 采样面板与自适应降级。
+
+## 8. P3 已落地：Worker + OffscreenCanvas 迁移
+
+### 8.1 架构
+
+```
+主线程（React 壳）                     Worker（sim.worker.ts）
+┌───────────────────────────┐  postMessage（可辨识联合协议）  ┌────────────────────────┐
+│ CanvasStage               │ ─────────────────────────────▶ │ Engine（状态唯一所有者）│
+│  - 控件/HUD（≤2Hz setState）│  init/resize/setNodeCount/     │  SimState SoA + 管线    │
+│  - WorkerEngine 门面       │  setPaused/start/stop          │  固定步长循环 + 绘制    │
+│  - ResizeObserver/DPR 监听 │ ◀───────────────────────────── │  → OffscreenCanvas     │
+└───────────────────────────┘  stats（500ms 节流快照）        └────────────────────────┘
+```
+
+- **状态所有权唯一**：`SimState`、网格、sprite 全部在 Worker 内创建；主线程只保存"最近一次控制指令"（viewport/nodeCount/paused）用于 init 同步，不复制模拟状态，不存在双份漂移。
+- **帧路径零序列化**：画布经 `transferControlToOffscreen` 一次性 Transferable 转移后，每帧的模拟与绘制完全在 Worker 内闭环，不经过 postMessage；跨线程消息只有低频控制指令与 500ms 节流的统计快照。
+- **协议**：`src/engine/protocol.ts` 中 `MainToWorkerMessage` / `WorkerToMainMessage` 可辨识联合，双向消息编译期受约束。
+- **调度器**：Worker 无 `requestAnimationFrame`，`Engine` 构造接受可插拔 `FrameScheduler`，默认 rAF、缺失时退化为 `setTimeout(16.6ms)`；主线程回退路径行为不变。
+- **生命周期**：`detach()` 先摘除 `onmessage` 再 `terminate()`；每次挂载新建 `<canvas>` 元素（OffscreenCanvas 转移不可逆，StrictMode 重挂必须用新元素）；`start()` 幂等，无双循环。
+- **回退**：`canUseWorkerEngine()` 特性检测（Worker / OffscreenCanvas / transferControlToOffscreen）+ attach 异常 try/catch，任一失败自动使用主线程 `Engine`，`EngineHandle` 接口保证两者可互换。
+- **调试参数**：`?engine=worker|main` 强制选择实现，`?nodes=N` 指定初始节点数（冒烟测试用）。
+
+### 8.2 验证数据（headless Chromium，生产构建，1280×800）
+
+迁移前后冒烟指标（HUD 上报，14s 采样去预热取中位）：
+
+| 实现 | 节点 | fps | p50 | p95 | p99 | 掉帧率 |
+|---|---|---|---|---|---|---|
+| main（迁移前路径） | 2000 | 60.0 | 16.70ms | 16.80ms | 16.80ms | 0.40% |
+| worker（P3） | 2000 | 60.0 | 16.70ms | 16.80ms | 16.80ms | 0.00% |
+| main（迁移前路径） | 4000 | 60.0 | 16.70ms | 16.70ms | 16.80ms | 0.30% |
+| worker（P3） | 4000 | 60.0 | 16.70ms | 16.80ms | 16.80ms | 0.30% |
+
+帧间隔为 vsync 上限（16.7ms），两种实现均满帧，worker 路径无劣化。
+
+生命周期 / 适配回归（Playwright 断言，12 项全过）：
+
+- StrictMode 双挂载（dev）：仅 1 个 Worker、无页面错误。
+- attach/detach ×20：无 Worker 泄漏，计数回落。
+- `?engine=main` 回退与删除 `transferControlToOffscreen` 的特性缺失回退：均无 Worker、循环正常、画布非空白。
+- DPR 1→2→1.5 与窗口缩放：Worker 侧位图尺寸恒等于 CSS 尺寸 × DPR，无错位。
+- 暂停/继续/切换节点数后循环正常。

@@ -3,11 +3,24 @@ import { PALETTE } from './state'
 
 const SPRITE_SIZE = 32
 
-export function createSprites(): HTMLCanvasElement[] {
+export type SpriteSource = HTMLCanvasElement | OffscreenCanvas
+export type RenderContext =
+  | CanvasRenderingContext2D
+  | OffscreenCanvasRenderingContext2D
+
+function createSpriteCanvas(): SpriteSource {
+  if (typeof OffscreenCanvas === 'function') {
+    return new OffscreenCanvas(SPRITE_SIZE, SPRITE_SIZE)
+  }
+  const c = document.createElement('canvas')
+  c.width = SPRITE_SIZE
+  c.height = SPRITE_SIZE
+  return c
+}
+
+export function createSprites(): SpriteSource[] {
   return PALETTE.map((color) => {
-    const c = document.createElement('canvas')
-    c.width = SPRITE_SIZE
-    c.height = SPRITE_SIZE
+    const c = createSpriteCanvas()
     const g = c.getContext('2d')!
     const half = SPRITE_SIZE / 2
     const grad = g.createRadialGradient(half, half, 0, half, half, half)
@@ -23,9 +36,9 @@ export function createSprites(): HTMLCanvasElement[] {
 }
 
 export function render(
-  ctx: CanvasRenderingContext2D,
+  ctx: RenderContext,
   s: SimState,
-  sprites: HTMLCanvasElement[],
+  sprites: SpriteSource[],
 ): void {
   ctx.clearRect(0, 0, s.width, s.height)
   const { x, y, radius, color } = s

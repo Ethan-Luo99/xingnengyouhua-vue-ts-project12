@@ -4,6 +4,7 @@ import { createSimState, setNodeCount } from './state'
 import { createGrid, resizeGrid, ensureGridCapacity } from './grid'
 import type { Grid } from './grid'
 import { applyForces, makeCollisionPass, integrate } from './passes'
+import type { RenderContext, SpriteSource } from './render'
 import { createSprites, render } from './render'
 
 const FIXED_DT = 1 / 60
@@ -21,6 +22,26 @@ export interface FrameStats {
   dropRate: number
 }
 
+export interface FrameScheduler {
+  requestFrame(cb: (now: number) => void): number
+  cancelFrame(id: number): void
+}
+
+function createDefaultScheduler(): FrameScheduler {
+  if (typeof requestAnimationFrame === 'function') {
+    return {
+      requestFrame: (cb) => requestAnimationFrame(cb),
+      cancelFrame: (id) => cancelAnimationFrame(id),
+    }
+  }
+  // Worker 环境没有 requestAnimationFrame，用定时器逼近 60Hz。
+  return {
+    requestFrame: (cb) =>
+      setTimeout(() => cb(performance.now()), 1000 / 60) as unknown as number,
+    cancelFrame: (id) => clearTimeout(id),
+  }
+}
+
 export class Engine {
   readonly state: SimState
   onStats: ((stats: FrameStats) => void) | null = null
@@ -28,9 +49,10 @@ export class Engine {
 
   private readonly grid: Grid
   private readonly pipeline: SimPass[]
-  private sprites: HTMLCanvasElement[] = []
-  private canvas: HTMLCanvasElement | null = null
-  private ctx: CanvasRenderingContext2D | null = null
+  private readonly scheduler: FrameScheduler
+  private sprites: SpriteSource[] = []
+  private canvas: HTMLCanvasElement | OffscreenCanvas | null = null
+  private ctx: RenderContext | null = null
   private rafId = 0
   private running = false
   private lastTime = 0
@@ -41,15 +63,16 @@ export class Engine {
   private sampleCount = 0
   private lastStatsAt = 0
 
-  constructor(capacity: number) {
+  constructor(capacity: number, scheduler: FrameScheduler = createDefaultScheduler()) {
+    this.scheduler = scheduler
     this.state = createSimState(capacity)
     this.grid = createGrid(MAX_RADIUS * 2, capacity)
     this.pipeline = [applyForces, makeCollisionPass(this.grid), integrate]
   }
 
-  attach(canvas: HTMLCanvasElement): void {
+  attach(canvas: HTMLCanvasElement | OffscreenCanvas): void {
     this.canvas = canvas
-    this.ctx = canvas.getContext('2d')
+    this.ctx = canvas.getContext('2d') as RenderContext | null
     if (this.sprites.length === 0) this.sprites = createSprites()
   }
 
@@ -80,19 +103,19 @@ export class Engine {
     if (this.running) return
     this.running = true
     this.lastTime = performance.now()
-    this.rafId = requestAnimationFrame(this.tick)
+    this.rafId = this.scheduler.requestFrame(this.tick)
   }
 
   stop(): void {
     if (!this.running) return
     this.running = false
-    cancelAnimationFrame(this.rafId)
+    this.scheduler.cancelFrame(this.rafId)
     this.rafId = 0
   }
 
   private readonly tick = (now: number): void => {
     if (!this.running) return
-    this.rafId = requestAnimationFrame(this.tick)
+    this.rafId = this.scheduler.requestFrame(this.tick)
 
     const frameMs = now - this.lastTime
     this.lastTime = now
