@@ -1,36 +1,50 @@
 import { useEffect, useRef, useState } from 'react'
-import { Engine } from '../engine/engine'
-import type { FrameStats } from '../engine/engine'
+import { createStageEngine } from '../engine/stage-engine'
+import type { StageEngine, StageMode } from '../engine/stage-engine'
+import type { FrameStats } from '../engine/sampler'
 
 const NODE_OPTIONS = [500, 1000, 2000, 4000]
 const MAX_CAPACITY = 4096
+const INITIAL_NODE_COUNT = 1000
 
 export function CanvasStage() {
   const containerRef = useRef<HTMLDivElement>(null)
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const engineRef = useRef<Engine | null>(null)
+  const engineRef = useRef<StageEngine | null>(null)
   const [stats, setStats] = useState<FrameStats | null>(null)
   const [paused, setPaused] = useState(false)
-  const [nodeCount, setNodeCount] = useState(1000)
+  const [nodeCount, setNodeCount] = useState(INITIAL_NODE_COUNT)
+  const [mode, setMode] = useState<StageMode | null>(null)
 
   useEffect(() => {
     const container = containerRef.current
-    const canvas = canvasRef.current
-    if (!container || !canvas) return
+    if (!container) return
 
-    const engine = new Engine(MAX_CAPACITY)
+    const engine = createStageEngine(MAX_CAPACITY)
     engineRef.current = engine
-    engine.attach(canvas)
     engine.onStats = setStats
+    engine.onModeChange = setMode
+    setMode(engine.mode)
+    engine.mount(container, INITIAL_NODE_COUNT)
 
+    let lastCssWidth = -1
+    let lastCssHeight = -1
     const applySize = () => {
       const rect = container.getBoundingClientRect()
       engine.setViewport(rect.width, rect.height, window.devicePixelRatio || 1)
+      lastCssWidth = rect.width
+      lastCssHeight = rect.height
     }
     applySize()
 
     const observer = new ResizeObserver(applySize)
     observer.observe(container)
+
+    const onWindowResize = () => {
+      const rect = container.getBoundingClientRect()
+      if (rect.width !== lastCssWidth || rect.height !== lastCssHeight) return
+      applySize()
+    }
+    window.addEventListener('resize', onWindowResize)
 
     let dprQuery = matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
     const onDprChange = () => {
@@ -41,13 +55,13 @@ export function CanvasStage() {
     }
     dprQuery.addEventListener('change', onDprChange)
 
-    engine.start()
-
     return () => {
       observer.disconnect()
+      window.removeEventListener('resize', onWindowResize)
       dprQuery.removeEventListener('change', onDprChange)
       engine.onStats = null
-      engine.detach()
+      engine.onModeChange = null
+      engine.unmount()
       engineRef.current = null
     }
   }, [])
@@ -57,8 +71,7 @@ export function CanvasStage() {
   }, [nodeCount])
 
   useEffect(() => {
-    const engine = engineRef.current
-    if (engine) engine.paused = paused
+    engineRef.current?.setPaused(paused)
   }, [paused])
 
   return (
@@ -79,6 +92,11 @@ export function CanvasStage() {
             </button>
           ))}
         </div>
+        {mode && (
+          <span className={`mode-badge mode-${mode}`}>
+            {mode === 'worker' ? 'Worker + OffscreenCanvas' : '主线程回退'}
+          </span>
+        )}
         {stats && (
           <div className="stats">
             <span>{stats.fps.toFixed(0)} fps</span>
@@ -89,9 +107,7 @@ export function CanvasStage() {
           </div>
         )}
       </div>
-      <div className="stage-canvas" ref={containerRef}>
-        <canvas ref={canvasRef} />
-      </div>
+      <div className="stage-canvas" ref={containerRef} />
     </div>
   )
 }

@@ -90,3 +90,21 @@
   height: 100%;
   display: block;
 }
+
+.mode-badge {
+  font: 11px var(--mono);
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.mode-worker {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+}
+
+.mode-main {
+  color: var(--text);
+}

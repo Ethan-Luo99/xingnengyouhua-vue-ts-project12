@@ -137,3 +137,69 @@ const pipeline: SimPass[] = [applyForces, solveCollisions, integrate, /* 数百 
 3. Canvas 2D 批量绘制（颜色分桶 / sprite 预渲染）。
 4. DPR + ResizeObserver 适配。
 5. fps 采样面板与自适应降级。
+
+## 8. P3 落地：Web Worker + OffscreenCanvas 全量迁移
+
+> 本节为 P3 路线的实际实现记录。模拟计算与绘制全部移出主线程，主线程仅保留 React 壳、控件与 HUD 订阅；主线程实现完整保留为运行时回退路径。
+
+### 8.1 模块划分
+
+- Worker 侧（模拟状态唯一所有者）：
+  - `src/engine/worker-runtime.ts`：持有 `SimState`、网格哈希、`SimPass[]` 管线、固定步长循环（rAF，rAF 不可用时退化为 `setTimeout`）、离屏 sprite 与 `OffscreenCanvas` 绘制、HUD 采样。
+  - `src/engine/sim.worker.ts`：Worker 入口，负责 init 握手、init 前消息排队、运行期消息分发。
+- 主线程侧：
+  - `src/engine/stage-engine.ts`：统一 `StageEngine` 接口 + `WorkerStageEngine` / `MainStageEngine` 两个实现 + 特性检测工厂。
+  - `src/engine/main-engine.ts`：回退用主线程引擎（原 P0–P2 实现）。
+  - `src/engine/sampler.ts`：两侧共用的零分配帧时环形采样器。
+- 共享：`types/state/grid/passes` 纯计算层两侧复用；`render.ts` 的上下文类型抽象为 `CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D`，sprite 生成同时提供 `HTMLCanvasElement` 与 `OffscreenCanvas` 版本。
+
+### 8.2 关键约束的实现方式
+
+- 状态所有权唯一：`SimState` 仅在 Worker 内创建，主线程从不持有节点数组，不存在双份漂移；主线程不再执行任何每帧计算（CDP tracing 主线程 `FireAnimationFrame` 回调为 0，见 8.4）。
+- 零 JSON 帧路径：
+  - 画布通过 `canvas.transferControlToOffscreen()` 以 Transferable 转移，仅一次。
+  - 每帧数据完全不跨线程；HUD 指标每 500ms 以一个 5×`float32` 的 `ArrayBuffer`（20 字节）Transferable 传回（`postMessage(..., [buffer])`），非每帧、且为二进制转移而非结构化序列化。
+  - 消息协议用 `src/engine/protocol.ts` 的可辨识联合（discriminated union）约束：`init | viewport | node-count | pause`（主→Worker），`stats | ready`（Worker→主）。
+- 生命周期（StrictMode 双挂载/卸载重挂）：
+  - `createStageEngine` 在 effect 内创建，cleanup 中 `worker.terminate()`、置空 `onmessage/onerror`（清理在途回调）、移除 canvas。
+  - dev StrictMode 实测：初始 setup→cleanup→setup 共创建 2 个 Worker，1 个被销毁、始终仅 1 个存活；离开页面全部销毁（0 存活）；重挂恢复 1 个，无双循环、无泄漏。
+- resize / DPR：`ResizeObserver` 观察容器 + `matchMedia('(resolution: Ndppx)')` 监听 DPR + `window resize` 兜底；尺寸/DPR 经 `viewport` 消息同步到 Worker，Worker 内设置 backing store 尺寸并 `setTransform(dpr,...)`。实测 resize 与 DPR 1→2、2→1 切换后 backing/CSS 比例恒等于当前 DPR，不错位、不模糊。
+- 回退：`Worker`、`OffscreenCanvas`、`transferControlToOffscreen` 任一缺失或 Worker 构造/运行抛错时自动回退 `MainStageEngine`，并经 `onModeChange` 在 HUD 显示当前路径。回退后暂停、节点数、尺寸/DPR、stats 功能完整。
+- 无新增运行时依赖；仍为 Canvas 2D（`OffscreenCanvas.getContext('2d')`），未使用 WebGL。
+
+### 8.3 验证方式
+
+- 无头 Chromium（chrome-headless-shell，DPR=2，窗口 1280×800，禁用 GPU 走软件合成）经零依赖 CDP 脚本驱动；脚本在 `scripts/`：
+  - `bench.mjs`：读取 HUD 的 fps/p50/p95/p99/掉帧率。
+  - `trace.mjs`：CDP tracing 统计主线程与 Worker 线程 `FireAnimationFrame` 回调的 p50/p95 与线程忙录占比。
+  - `lifecycle.mjs`：跟踪 dedicated worker 目标的创建/存活/销毁。
+  - `capability.mjs`：页面脚本执行前删除 `Worker` 或 `OffscreenCanvas`，验证特性检测回退。
+  - `resize.mjs`：多组 resize/DPR 组合下比对 backing store / CSS 尺寸比例。
+  - `controls.mjs`：验证暂停/继续、节点数切换命令对 Worker 生效。
+
+### 8.4 迁移前后冒烟对比（2000 / 4000 节点）
+
+HUD 帧间隔（软件合成下 rAF 锁定 16.7ms，两侧均稳定 60fps，无掉帧差异）：
+
+| 规模 | 版本 | fps | p50 | p95 | p99 | 掉帧率 |
+|---|---|---|---|---|---|---|
+| 2000 | 迁移前 | 60 | 16.7ms | 16.7ms | 16.8ms | 0% |
+| 2000 | Worker | 60 | 16.7ms | 16.8ms | 16.8ms | 0.5% |
+| 4000 | 迁移前 | 60 | 16.7ms | 16.7ms | 16.8ms | 0.3% |
+| 4000 | Worker | 60 | 16.7ms | 16.8ms | 16.8ms | 0.8% |
+
+CDP tracing：每帧实际计算/绘制回调耗时（迁移前在主线程，迁移后在 Worker 线程）：
+
+| 规模 | 版本 | 承载线程 | 回调 p50 | 回调 p95 | 线程忙录 |
+|---|---|---|---|---|---|
+| 2000 | 迁移前 | 主线程 | ~1.96–2.31ms | ~2.39–2.84ms | 主线程 ~26–29% |
+| 2000 | Worker | Worker 线程 | ~1.86–1.99ms | ~2.20–2.53ms | 主线程 ~0.7–0.8% / Worker ~23–25% |
+| 4000 | 迁移前 | 主线程 | ~11.27–12.57ms | ~12.39–13.55ms | 主线程 ~137–153% |
+| 4000 | Worker | Worker 线程 | ~11.20–12.30ms | ~12.16–13.23ms | 主线程 ~0.2–0.3% / Worker ~135–148% |
+
+结论：单帧计算+绘制耗时迁移前后基本持平（同一算法、无序列化热路径开销），未出现明显劣化；负载从主线程近乎完全转移到 Worker（主线程帧回调 0、忙录 <1%），主线程被完全释放。软件合成环境下 rAF 帧间隔恒为 16.7ms，HUD 的 p50/p95 无法反映负载差异，故以 tracing 的回调耗时作为主对比口径；真实 60Hz 硬件 + GPU 合成下的体感数据需在桌面 Chrome 复测（见 8.5）。
+
+### 8.5 已闭环与未闭环项
+
+- 已闭环（无头 Chromium 实测）：Worker 模式画面正确且 DPR=2 锐利；迁移前后 2000/4000 fps/帧时不劣化、主线程负载近零；StrictMode 双挂载/卸载/重挂无 Worker 泄漏与双循环；删除 `Worker`/`OffscreenCanvas` 及 `?fallback` 强制回退功能完整；resize/DPR 不错位不模糊；暂停/节点数控件生效；`npm run build`、`tsc -b`、`oxlint` 全部通过；无新增运行时依赖。
+- 环境限制（无法在此容器内验证）：真实 60Hz/120Hz 显示器 + GPU 合成下的体感 fps、跨物理显示器拖动窗口时浏览器原生 DPR 媒体查询触发时机（容器内以合成 resize 事件等效验证应用层处理）；Safari 等浏览器的 OffscreenCanvas 兼容性（已由特性检测 + 回退覆盖，但未逐浏览器实跑）。
