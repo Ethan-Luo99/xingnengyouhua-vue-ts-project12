@@ -203,3 +203,80 @@ CDP tracing：每帧实际计算/绘制回调耗时（迁移前在主线程，�
 
 - 已闭环（无头 Chromium 实测）：Worker 模式画面正确且 DPR=2 锐利；迁移前后 2000/4000 fps/帧时不劣化、主线程负载近零；StrictMode 双挂载/卸载/重挂无 Worker 泄漏与双循环；删除 `Worker`/`OffscreenCanvas` 及 `?fallback` 强制回退功能完整；resize/DPR 不错位不模糊；暂停/节点数控件生效；`npm run build`、`tsc -b`、`oxlint` 全部通过；无新增运行时依赖。
 - 环境限制（无法在此容器内验证）：真实 60Hz/120Hz 显示器 + GPU 合成下的体感 fps、跨物理显示器拖动窗口时浏览器原生 DPR 媒体查询触发时机（容器内以合成 resize 事件等效验证应用层处理）；Safari 等浏览器的 OffscreenCanvas 兼容性（已由特性检测 + 回退覆盖，但未逐浏览器实跑）。
+
+---
+
+## 9. 确定性回放 + 快照恢复（时间旅行）
+
+> 在第 8 节 Worker + OffscreenCanvas 架构上引入时间旅行：模拟结果完全由 `(初始状态, 控制消息序列)`
+> 决定；可在任意帧边界导出/导入完整二进制快照；支持录制—回放；`?selftest=1` 三方哈希自检。
+> 主线程回退路径运行同一确定性内核，能力对齐（HUD 徽标如实区分执行位置，不存在"静默失效"）。
+
+### 9.1 确定性审计（逐项）
+
+| 非确定性来源 | 改动前是否存在 | 处理 |
+|---|---|---|
+| `Math.random()` | 存在：`state.ts#seedNode` 用 `Math.random()` 生成位置/角度/速度/半径 | 新增 `rng.ts` 的可播种 Mulberry32 `DeterministicRng`；`setNodeCount(s, n, rng)` 显式注入；内核仅此一个随机源，RNG 的 32 位状态入快照 |
+| 对象遍历顺序（`for...in` / `Map` / `Object.keys`） | 不存在：所有 pass 与网格均为 TypedArray 上的 `for (let i=0;i<n;i++)` 索引顺序；网格用计数排序式双数组，无 hash 桶遍历 | 保持不变；网格条目的产生顺序由节点索引固定，碰撞仅遍历 `j>i` 且同格/邻格按 `cy,cx,k` 固定序 |
+| 浮点累加顺序 | 不存在跨次运行差异：每个 pass 对固定索引顺序做标量运算；碰撞响应 `push/imp` 的读写顺序由 `i,j` 固定 | 保持顺序；状态哈希直接对 Float32 原始位（`Uint8Array(buffer)`）做 FNV-1a，"逐位一致"按位而非按误差判定 |
+| 多步/掉帧导致的步进次数差异 | 存在风险：累加器 + `MAX_STEPS` 使同一现实时刻在不同帧率下步进次数不同 | 确定性只约束"相同帧号 N"：帧号=固定步计数 `stepCount`；录制以逻辑帧为锚点（见 9.3），回放驱动器每帧恰好一步，不接触墙钟。实时循环的掉帧丢弃不影响"同一消息序列重放到第 N 帧" |
+| 时间/`Date.now`/`performance.now` 进入物理 | 不存在：`performance.now()` 只驱动累加器与采样，不写入状态 | 自检与回放路径完全不读墙钟 |
+| 多线程竞争 / 共享内存 | 不存在：状态仅 Worker 内单线程持有，无 `SharedArrayBuffer` | 不变 |
+| RNG 跨平台浮点差异 | 仅用 `Math.imul/^/>>>` 整数运算与 IEEE-754 单精度 `Float32Array` | 不依赖宿主 libm 随机；三角函数在同一 V8 下确定（跨引擎的 libm 差异不在本项目验证范围） |
+
+同一控制序列跑两遍到第 N 帧，所有 SoA 字段、`count`、RNG 状态、`stepCount` 的字节完全一致，
+由 `?selftest=1` 的 live/snapshot/replay 三方哈希在 10 个检查点全部相等闭环。
+
+### 9.2 模块划分（新增/改动）
+
+- `engine/rng.ts`：确定性 Mulberry32 PRNG（32 位可序列化状态）。
+- `engine/sim-kernel.ts`：纯模拟内核 `SimCore`（SoA + 网格 + pass 管线 + RNG + `stepCount` + `accumulator` + `paused`），
+  `createSimCore / coreSetViewport / coreSetNodeCount / coreStep`；Worker 与主线程回退共用，物理零分叉。
+- `engine/time-travel.ts`：
+  - 二进制快照 `exportSnapshot/restoreSnapshot`（64 字节头 + 每节点 21 字节，小端 `DataView`，魔数 `SNAP`）；
+  - `stateHash`：对 stepCount/count/RNG/宽高 + 全部活动节点的 x,y,vx,vy,radius 的原始 Float32 位与 color 字节做 FNV-1a；
+  - `ControlRecorder`：录制控制消息，记录起止逻辑帧与"录制开始时刻"的基线快照；
+  - `replaySequence`（从初始状态重放）与 `replayRecording`（恢复基线 + 重放录制段）。
+- `engine/selftest.ts`：与渲染/墙钟无关的确定性自检，两条执行路径共用。
+- `engine/protocol.ts`：可辨识联合扩展，主→Worker 增加 `record | export-snapshot | import-snapshot | replay-start | selftest-start`；
+  Worker→主增加 `snapshot | selftest-result`；`stats` 二进制帧扩展为 7×float32，末 lane 以原始 uint32 位携带状态哈希。
+- `engine/worker-runtime.ts` / `main-engine.ts`：都持有 `SimCore`；录制/快照/回放/自检语义一致。
+- `components/CanvasStage.tsx`：控件区新增 录制/停止录制、回放、导出快照、导入快照；HUD 增加"帧 N / 哈希 xxxxxxxx"与自检徽标。
+
+### 9.3 快照与回放语义
+
+- **快照内容**：`stepCount`、逻辑帧、`count`、`capacity`、逻辑宽高、RNG 状态、`accumulator`、`paused`、
+  全量 x/y/vx/vy/radius/color（按 capacity 存储，含非活动槽，保证恢复后再次加节点也逐位一致）。
+  网格哈希是纯派生量，每帧第一步 `buildGrid` 即重建，故不入快照。
+- **传输**：Worker 导出/导入都走 `postMessage(buffer, [buffer])` Transferable，零 JSON、零结构化序列化；
+  主线程保存为单个 `ArrayBuffer`（UI 另提供 `.bin` 下载/读取）。导入后立即按恢复状态重绘一帧，画面无跳变、HUD 帧号/哈希连续。
+- **录制**：开始时记录当前逻辑帧并捕获基线快照；期间每条控制消息按其到达时的 `stepCount` 锚定；
+  停止时记录结束帧。
+- **回放**：恢复录制开始时的基线，再按帧锚点重放控制（同帧多条按到达序），逐帧推进到结束帧，
+  并在到达结束帧后排空锚定该帧的消息（含最后一条 pause），从而连 `paused` 标志也精确还原。
+  因此暂停/继续穿插的录制也能逐位重建（实测录制段结束帧帧号与哈希与首跑完全相等）。
+
+### 9.4 生命周期与回退
+
+- 新消息全部纳入 `MainToWorkerMessage` / `WorkerToMainMessage` 可辨识联合，`switch` 穷尽处理。
+- StrictMode 双挂载/terminate 后重挂：录制状态、待完成的快照请求在 `unmount` 中随 worker 一并销毁
+  （`snapshotWaiters.clear()`、`terminate()`），重挂是全新会话，不会把旧 worker 的快照/录制串到新实例。
+- 主线程回退（`?fallback` 或特性探测失败）运行**同一个** `SimCore` 与同一个 `selftest.ts`，
+  录制/快照/回放/自检全部支持且哈希与 Worker 路径一致；差异仅 HUD 徽标显示"主线程回退"。
+  不存在"回退路径静默不支持某项能力"的情况。
+
+### 9.5 自检 `?selftest=1`
+
+Worker（回退时为主线程）内：
+1. 固定初始控制序列（1280×720、1000 节点、未暂停）与固定种子，跑 600 个理想固定步，每 60 帧记一次哈希（live）；
+2. 每个检查点：重放到该帧 → 导出快照 → 恢复进第二个 core → 哈希（snapshot）；
+3. 用录制的消息序列在第三个 core 上重放 → 哈希（replay）；
+4. 三方逐位比对，结果打印到控制台并回传主线程显示"自检 PASS/FAIL"徽标。
+
+驱动脚本：`scripts/selftest.mjs`（零依赖 CDP，同时捕获页面与 Worker 的 console）。
+
+### 9.6 回归
+
+- 无新增运行时依赖；仍为 Canvas 2D（`OffscreenCanvas.getContext('2d')`）。
+- `npm run build`（`tsc -b` + `vite build`）、`oxlint` 均通过。
+- 2000/4000 节点 HUD：60fps，p50 16.7ms，无性能劣化（热循环仍是同一条 SoA pass 管线，时间旅行逻辑不在每帧热路径）。

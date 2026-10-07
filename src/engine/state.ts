@@ -1,4 +1,5 @@
 import type { SimState } from './types'
+import type { DeterministicRng } from './rng'
 
 export const PALETTE = [
   '#7c6cf0',
@@ -24,21 +25,25 @@ export function createSimState(capacity: number): SimState {
   }
 }
 
-function seedNode(s: SimState, i: number): void {
-  s.x[i] = Math.random() * s.width
-  s.y[i] = Math.random() * s.height
-  const angle = Math.random() * Math.PI * 2
-  const speed = 20 + Math.random() * 60
+function seedNode(s: SimState, i: number, rng: DeterministicRng): void {
+  s.x[i] = rng.next() * s.width
+  s.y[i] = rng.next() * s.height
+  const angle = rng.next() * Math.PI * 2
+  const speed = 20 + rng.next() * 60
   s.vx[i] = Math.cos(angle) * speed
   s.vy[i] = Math.sin(angle) * speed
-  s.radius[i] = 2.5 + Math.random() * 3.5
+  s.radius[i] = 2.5 + rng.next() * 3.5
   s.color[i] = i % PALETTE.length
 }
 
-export function setNodeCount(s: SimState, n: number): void {
+export function setNodeCount(
+  s: SimState,
+  n: number,
+  rng: DeterministicRng,
+): void {
   const target = Math.max(0, Math.min(n, s.capacity))
   if (target > s.count) {
-    for (let i = s.count; i < target; i++) seedNode(s, i)
+    for (let i = s.count; i < target; i++) seedNode(s, i, rng)
   }
   s.count = target
 }

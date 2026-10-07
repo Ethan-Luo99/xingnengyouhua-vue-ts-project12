@@ -1,4 +1,5 @@
 import { WorkerRuntime } from './worker-runtime'
+import { DEFAULT_SEED } from './sim-kernel'
 import type {
   InitMessage,
   MainToWorkerMessage,
@@ -27,7 +28,12 @@ scope.addEventListener('message', (event: MessageEvent<MainToWorkerMessage>) => 
     return
   }
   const init = msg as InitMessage
-  runtime = new WorkerRuntime(init.capacity, init.canvas, scope)
+  runtime = new WorkerRuntime(
+    init.capacity,
+    init.canvas,
+    scope,
+    init.seed ?? DEFAULT_SEED,
+  )
   for (const queued of pending) runtime.handleMessage(queued)
   pending.length = 0
   runtime.start()

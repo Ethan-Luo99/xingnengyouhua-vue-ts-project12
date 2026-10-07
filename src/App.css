@@ -108,3 +108,32 @@
 .mode-main {
   color: var(--text);
 }
+
+.timetravel {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.stage-toolbar button.recording {
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+.stage-toolbar button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.selftest-pass {
+  color: #06d6a0;
+  border-color: #06d6a055;
+  background: #06d6a018;
+}
+
+.selftest-fail {
+  color: #f72585;
+  border-color: #f7258555;
+  background: #f7258518;
+}
