@@ -7,6 +7,8 @@ export interface SimState {
   vy: Float32Array
   radius: Float32Array
   color: Uint8Array
+  /** Deterministic PRNG state (mulberry32). One element is enough. */
+  rngState: Uint32Array
   width: number
   height: number
 }

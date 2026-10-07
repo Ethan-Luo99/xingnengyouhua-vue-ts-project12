@@ -1,19 +1,35 @@
-import type { SimPass, SimState } from './types'
-import { createSimState, setNodeCount } from './state'
-import { createGrid, resizeGrid, ensureGridCapacity } from './grid'
-import type { Grid } from './grid'
-import { applyForces, makeCollisionPass, integrate } from './passes'
+import { SimCore, FIXED_DT } from './sim-core'
 import { createOffscreenSprites, render } from './render'
 import type { AnyCanvas } from './render'
 import { FrameStatsSampler } from './sampler'
 import { encodeStats } from './protocol'
-import type { MainToWorkerMessage } from './protocol'
+import type {
+  MainToWorkerMessage,
+  SelfTestReportMessage,
+  TimelineMode,
+  WorkerToMainMessage,
+} from './protocol'
+import {
+  CONTROL_NODE_COUNT,
+  CONTROL_PAUSE,
+  CONTROL_VIEWPORT,
+  ControlJournal,
+} from './timeline'
+import { hashState } from './hash'
+import { restoreSnapshot, takeSnapshot } from './snapshot'
+import {
+  buildReport,
+  replayJournal,
+  runDeterministic,
+  snapshotRestoreLeg,
+  verifyRestoredSnapshot,
+} from './selftest'
+import type { DeterministicRun } from './selftest'
 
-const FIXED_DT = 1 / 60
 const MAX_STEPS = 3
 const STATS_INTERVAL_MS = 500
-const MAX_RADIUS = 6
 const FALLBACK_FRAME_MS = 1000 / 60
+const REPLAY_STEPS_PER_TICK = 2
 
 interface WorkerScope {
   postMessage(message: unknown, transfer?: Transferable[]): void
@@ -22,12 +38,17 @@ interface WorkerScope {
   cancelAnimationFrame?: (handle: number) => void
 }
 
+interface PendingSelfTest {
+  run: DeterministicRun
+  replayHashes: Map<number, number>
+}
+
 export class WorkerRuntime {
-  private readonly state: SimState
-  private readonly grid: Grid
-  private readonly pipeline: SimPass[]
+  private readonly core: SimCore
   private readonly sprites: AnyCanvas[]
   private readonly sampler = new FrameStatsSampler()
+  private readonly journal = new ControlJournal()
+  private readonly capacity: number
   private readonly emit: (buffer: ArrayBuffer) => void
 
   private canvas: OffscreenCanvas | null = null
@@ -42,10 +63,16 @@ export class WorkerRuntime {
   private readonly useRaf: boolean
   private readonly scope: WorkerScope
 
+  private mode: TimelineMode = 'live'
+  private recording = false
+  private recordBaseline: ArrayBuffer | null = null
+  private replayTarget = -1
+  private replayIdx = 0
+  private pendingSelfTest: PendingSelfTest | null = null
+
   constructor(capacity: number, canvas: OffscreenCanvas, scope: WorkerScope) {
-    this.state = createSimState(capacity)
-    this.grid = createGrid(MAX_RADIUS * 2, capacity)
-    this.pipeline = [applyForces, makeCollisionPass(this.grid), integrate]
+    this.capacity = capacity
+    this.core = new SimCore(capacity)
     this.sprites = createOffscreenSprites()
     this.canvas = canvas
     this.ctx = canvas.getContext('2d')
@@ -68,6 +95,25 @@ export class WorkerRuntime {
         break
       case 'pause':
         this.paused = msg.paused
+        this.recordControl(CONTROL_PAUSE, msg.paused ? 1 : 0)
+        break
+      case 'record':
+        this.setRecording(msg.recording)
+        break
+      case 'replay':
+        this.startReplay(msg.target)
+        break
+      case 'snapshot-export':
+        this.exportSnapshot(msg.requestId)
+        break
+      case 'snapshot-import':
+        this.importSnapshot(msg.requestId, msg.buffer)
+        break
+      case 'selftest':
+        this.runSelfTest()
+        break
+      case 'selftest-buffers':
+        this.finishSelfTest(msg.baseline, msg.snapshot300)
         break
       case 'init':
         break
@@ -115,35 +161,62 @@ export class WorkerRuntime {
     this.lastTime = now
     this.sampler.record(frameMs)
 
-    if (!this.paused) {
-      this.accumulator += Math.min(frameMs, 100) / 1000
-      let steps = 0
-      while (this.accumulator >= FIXED_DT && steps < MAX_STEPS) {
-        this.step(FIXED_DT)
-        this.accumulator -= FIXED_DT
-        steps++
+    if (this.mode === 'live') {
+      if (!this.paused) {
+        this.accumulator += Math.min(frameMs, 100) / 1000
+        let steps = 0
+        while (this.accumulator >= FIXED_DT && steps < MAX_STEPS) {
+          this.core.step()
+          this.accumulator -= FIXED_DT
+          steps++
+        }
+        if (steps === MAX_STEPS) this.accumulator = 0
       }
-      if (steps === MAX_STEPS) this.accumulator = 0
+    } else {
+      this.advanceReplay(now)
     }
 
     this.drawFrame()
     this.maybeReport(now)
   }
 
-  private step(dt: number): void {
-    for (const pass of this.pipeline) pass(this.state, dt)
+  private drawFrame(): void {
+    if (this.ctx) render(this.ctx, this.core.state, this.sprites)
   }
 
-  private drawFrame(): void {
-    if (this.ctx) render(this.ctx, this.state, this.sprites)
+  private reportNow(): void {
+    if (!this.sampler.hasEnoughSamples) return
+    const stats = this.sampler.snapshot()
+    this.lastStatsAt = performance.now()
+    this.emit(
+      encodeStats(
+        stats.fps,
+        stats.p50,
+        stats.p95,
+        stats.p99,
+        stats.dropRate,
+        this.core.frameCount,
+        hashState(this.core.state),
+      ),
+    )
   }
 
   private maybeReport(now: number): void {
     if (!this.sampler.hasEnoughSamples) return
     if (now - this.lastStatsAt < STATS_INTERVAL_MS) return
     this.lastStatsAt = now
-    const s = this.sampler.snapshot()
-    this.emit(encodeStats(s.fps, s.p50, s.p95, s.p99, s.dropRate))
+    const stats = this.sampler.snapshot()
+    this.emit(
+      encodeStats(
+        stats.fps,
+        stats.p50,
+        stats.p95,
+        stats.p99,
+        stats.dropRate,
+        this.core.frameCount,
+        hashState(this.core.state),
+      ),
+    )
   }
 
   private setViewport(width: number, height: number, dpr: number): void {
@@ -152,14 +225,201 @@ export class WorkerRuntime {
       this.canvas.height = Math.max(1, Math.round(height * dpr))
     }
     this.ctx?.setTransform(dpr, 0, 0, dpr, 0, 0)
-    this.state.width = width
-    this.state.height = height
-    resizeGrid(this.grid, width, height)
+    this.core.setViewport(width, height)
+    this.recordControl(CONTROL_VIEWPORT, width, height)
     this.drawFrame()
   }
 
   private setNodeCount(n: number): void {
-    ensureGridCapacity(this.grid, this.state.capacity)
-    setNodeCount(this.state, n)
+    this.core.setNodeCount(n)
+    this.recordControl(CONTROL_NODE_COUNT, n)
   }
+
+  // ---- time travel -------------------------------------------------------
+
+  private recordControl(kind: number, a: number, b = 0): void {
+    if (!this.recording || this.mode !== 'live') return
+    this.journal.record(this.core.frameCount, kind, a, b)
+    this.emitTimeline()
+  }
+
+  private setRecording(on: boolean): void {
+    if (on === this.recording) return
+    if (on) {
+      this.cancelReplay()
+      this.journal.clear()
+      this.recordBaseline = takeSnapshot({
+        state: this.core.state,
+        grid: this.core.grid,
+        frame: this.core.frameCount,
+        accumulator: this.accumulator,
+        paused: this.paused,
+      })
+      this.recording = true
+    } else {
+      this.recording = false
+      // The throttled stats stream may lag the true frame by up to 500ms;
+      // flush exact telemetry so the recorded "last frame" hash is usable.
+      this.reportNow()
+    }
+    this.emitTimeline()
+  }
+
+  private startReplay(target: number): void {
+    if (this.mode === 'replaying') return
+    const baseline = this.recordBaseline
+    if (!baseline) return
+    this.recording = false
+    const header = restoreSnapshot(baseline, this.core.state, this.core.grid)
+    this.core.setFrame(header.frame)
+    this.accumulator = 0
+    this.replayIdx = 0
+    // Frame numbers are absolute: never target a frame before the baseline.
+    this.replayTarget = Math.max(target, header.frame)
+    this.mode = 'replaying'
+    this.applyDueControls()
+    this.emitTimeline()
+  }
+
+  private cancelReplay(): void {
+    if (this.mode !== 'replaying') return
+    this.mode = 'live'
+    this.replayTarget = -1
+  }
+
+  private applyDueControls(): void {
+    while (
+      this.replayIdx < this.journal.length &&
+      this.journal.frameAt(this.replayIdx) === this.core.frameCount
+    ) {
+      this.journal.applyAt(this.core, this.replayIdx)
+      this.replayIdx++
+    }
+  }
+
+  private advanceReplay(now: number): void {
+    if (this.replayTarget < 0) return
+    let guard = 0
+    while (
+      this.core.frameCount < this.replayTarget &&
+      guard < REPLAY_STEPS_PER_TICK
+    ) {
+      // Live semantics: a message tagged at frame f is applied before the
+      // f -> f+1 step. Apply controls at the current frame, then step.
+      this.applyDueControls()
+      this.core.step()
+      guard++
+    }
+    // Controls tagged exactly at the target frame land after the final step,
+    // matching the post-arrival live state at that frame.
+    this.applyDueControls()
+    if (this.core.frameCount >= this.replayTarget) {
+      this.replayTarget = -1
+      this.mode = 'live'
+      this.paused = true
+      // Flush exact end-of-replay telemetry so the HUD does not show a
+      // throttled, earlier-frame hash.
+      this.lastStatsAt = now
+      this.reportNow()
+      this.emitTimeline()
+    }
+  }
+
+  private exportSnapshot(requestId: number): void {
+    const buffer = takeSnapshot({
+      state: this.core.state,
+      grid: this.core.grid,
+      frame: this.core.frameCount,
+      accumulator: this.accumulator,
+      paused: this.paused,
+    })
+    this.post({ type: 'snapshot-exported', requestId, buffer }, [buffer])
+  }
+
+  private importSnapshot(requestId: number, buffer: ArrayBuffer): void {
+    const header = restoreSnapshot(buffer, this.core.state, this.core.grid)
+    this.core.setFrame(header.frame)
+    this.accumulator = header.accumulator
+    this.paused = header.paused
+    this.cancelReplay()
+    this.recording = false
+    this.drawFrame()
+    const hash = hashState(this.core.state)
+    this.lastStatsAt = performance.now()
+    this.reportNow()
+    this.post({ type: 'snapshot-imported', requestId, frame: header.frame, hash })
+    this.emitTimeline()
+  }
+
+  // ---- self-test ---------------------------------------------------------
+
+  private runSelfTest(): void {
+    const run = runDeterministic(this.capacity)
+    const replayHashes = replayJournal(
+      this.capacity,
+      run.journal,
+      run.frames,
+    )
+    this.pendingSelfTest = { run, replayHashes }
+    // Cross the worker -> main boundary by transfer, then back again.
+    this.post(
+      {
+        type: 'selftest-snapshots',
+        baseline: run.baseline,
+        snapshot300: run.snapshot300,
+      },
+      [run.baseline, run.snapshot300],
+    )
+  }
+
+  private finishSelfTest(baseline: ArrayBuffer, snapshot300: ArrayBuffer): void {
+    const pending = this.pendingSelfTest
+    if (!pending) return
+    this.pendingSelfTest = null
+    const { run, replayHashes } = pending
+    const snapshotHashes = snapshotRestoreLeg(
+      this.capacity,
+      run.journal,
+      baseline,
+      snapshot300,
+      run.frames,
+    )
+    const roundtripHash = verifyRestoredSnapshot(this.capacity, snapshot300)
+    const report = buildReport(
+      run,
+      replayHashes,
+      snapshotHashes,
+      roundtripHash,
+      true,
+    )
+    this.post(reportToMessage(report))
+  }
+
+  private emitTimeline(): void {
+    this.post({
+      type: 'timeline',
+      mode: this.mode,
+      frame: this.core.frameCount,
+      hash: hashState(this.core.state),
+      paused: this.paused,
+      recording: this.recording,
+      replaying: this.mode === 'replaying',
+      messages: this.journal.length,
+    })
+  }
+
+  private post(message: WorkerToMainMessage, transfer?: Transferable[]): void {
+    if (transfer) this.scope.postMessage(message, transfer)
+    else this.scope.postMessage(message)
+  }
+}
+
+function reportToMessage(report: {
+  pass: boolean
+  transferred: boolean
+  snapshotRoundtrip: boolean
+  checkpoints: SelfTestReportMessage['checkpoints']
+  failures: string[]
+}): SelfTestReportMessage {
+  return { type: 'selftest-report', ...report }
 }

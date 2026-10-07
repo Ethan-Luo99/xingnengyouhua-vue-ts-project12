@@ -4,6 +4,8 @@ export interface FrameStats {
   p95: number
   p99: number
   dropRate: number
+  frame: number
+  hash: number
 }
 
 const SAMPLE_SIZE = 600
@@ -39,6 +41,8 @@ export class FrameStatsSampler {
       p95: pick(0.95),
       p99: pick(0.99),
       dropRate: dropped / n,
+      frame: 0,
+      hash: 0,
     }
   }
 
